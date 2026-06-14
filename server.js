@@ -42,12 +42,25 @@ app.get('/price', async (req, res) => {
     const rawLowest = data.lowest_price || data.median_price || '0';
     const price = parseFloat(rawLowest.replace(/[^0-9.,]/g, '').replace(',', '.'));
 
+    // Also grab icon via market search
+    let icon = null;
+    try {
+      const searchUrl = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=1&query=${encodeURIComponent(name)}`;
+      const sr = await fetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const sd = await sr.json();
+      if (sd.success && sd.results && sd.results[0]) {
+        const iconHash = sd.results[0]?.asset_description?.icon_url;
+        if (iconHash) icon = `https://community.akamai.steamstatic.com/economy/image/${iconHash}/75fx75f`;
+      }
+    } catch {}
+
     const result = {
       name,
       lowest_price: price,
       raw_lowest: data.lowest_price,
       median_price: data.median_price,
       volume: data.volume,
+      icon,
     };
 
     cache.set(cacheKey, { data: result, ts: Date.now() });
@@ -92,12 +105,24 @@ app.post('/prices', async (req, res) => {
       } else {
         const rawLowest = data.lowest_price || data.median_price || '0';
         const price = parseFloat(rawLowest.replace(/[^0-9.,]/g, '').replace(',', '.'));
+        // Grab icon via search
+        let icon = null;
+        try {
+          const searchUrl = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=1&query=${encodeURIComponent(name)}`;
+          const sr = await fetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+          const sd = await sr.json();
+          if (sd.success && sd.results && sd.results[0]) {
+            const iconHash = sd.results[0]?.asset_description?.icon_url;
+            if (iconHash) icon = `https://community.akamai.steamstatic.com/economy/image/${iconHash}/75fx75f`;
+          }
+        } catch {}
         const result = {
           name,
           lowest_price: price,
           raw_lowest: data.lowest_price,
           median_price: data.median_price,
           volume: data.volume,
+          icon,
         };
         cache.set(cacheKey, { data: result, ts: Date.now() });
         results[name] = result;
