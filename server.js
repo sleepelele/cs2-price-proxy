@@ -7,101 +7,124 @@ app.use(cors());
 app.use(express.json());
 
 const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 min for prices
-const SEARCH_CACHE_TTL = 30 * 1000; // 30s for search
-
-const STEAM_PRICE_URL = 'https://steamcommunity.com/market/priceoverview/?appid=730&currency=3&market_hash_name=';
-const STEAM_SEARCH_URL = 'https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=10&query=';
+const PRICE_TTL = 5 * 60 * 1000;   // 5 min
+const SEARCH_TTL = 30 * 1000;       // 30s
+const ICON_TTL = 60 * 60 * 1000;   // 1hr
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
+const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+
+// Parse a Steam price string like "0,49€", "€0.49", "$0.49" → float
 function parsePrice(raw) {
   if (!raw) return null;
-  return parseFloat(raw.replace(/[^0-9.,]/g, '').replace(',', '.')) || null;
+  const cleaned = raw.replace(/[^0-9.,]/g, '').replace(',', '.');
+  const val = parseFloat(cleaned);
+  return isNaN(val) ? null : val;
 }
 
-// ─── Single price fetch ───────────────────────────────────────────────────────
+// Fetch price + icon for one item using the search/render endpoint
+// This is more reliable than priceoverview as it's the same endpoint used by autocomplete
+async function fetchItemData(name) {
+  const key = 'price:' + name.toLowerCase();
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.ts < PRICE_TTL) return { ...hit.data, cached: true };
+
+  // Use search endpoint — search for exact name, take first result
+  const url = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=1&query=${encodeURIComponent(name)}`;
+  const r = await fetch(url, { headers: HEADERS });
+
+  if (r.status === 429) throw new Error('rate_limited');
+  const d = await r.json();
+
+  if (!d.success || !d.results || d.results.length === 0) {
+    return { name, error: 'not_found' };
+  }
+
+  // Find exact match (search may return similar items)
+  const match = d.results.find(i => i.hash_name === name) || d.results[0];
+
+  const icon = match.asset_description?.icon_url
+    ? `https://community.akamai.steamstatic.com/economy/image/${match.asset_description.icon_url}/75fx75f`
+    : null;
+
+  // sale_price is in cents (USD), but sell_price_text has the display string
+  // We want EUR — use the priceoverview for EUR conversion on exact name
+  // But as fallback, sale_price / 100 gives USD
+  const priceText = match.sell_price_text || match.sale_price_text || null;
+  const priceUSD = match.sell_price ? match.sell_price / 100 : null;
+
+  // Try to get EUR price via priceoverview (fast, single item)
+  let eurPrice = null;
+  try {
+    const po = await fetch(
+      `https://steamcommunity.com/market/priceoverview/?appid=730&currency=3&market_hash_name=${encodeURIComponent(match.hash_name)}`,
+      { headers: HEADERS }
+    );
+    if (po.ok) {
+      const pod = await po.json();
+      if (pod.success) {
+        eurPrice = parsePrice(pod.lowest_price) || parsePrice(pod.median_price);
+      }
+    }
+  } catch {}
+
+  const result = {
+    name: match.hash_name,
+    lowest_price: eurPrice,         // EUR from priceoverview
+    price_usd: priceUSD,            // USD fallback from search
+    price_text: priceText,          // display string
+    volume: match.sell_listings,
+    icon,
+  };
+
+  cache.set(key, { data: result, ts: Date.now() });
+  return result;
+}
+
+// ─── Single price ─────────────────────────────────────────────────────────────
 app.get('/price', async (req, res) => {
   const name = req.query.name;
   if (!name) return res.status(400).json({ error: 'Missing name' });
-
-  const key = 'price:' + name.toLowerCase();
-  const hit = cache.get(key);
-  if (hit && Date.now() - hit.ts < CACHE_TTL) return res.json({ ...hit.data, cached: true });
-
   try {
-    const r = await fetch(STEAM_PRICE_URL + encodeURIComponent(name), {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
-    if (r.status === 429) return res.status(429).json({ error: 'Steam rate limited' });
-    const d = await r.json();
-    if (!d.success) return res.status(404).json({ error: 'Not found', name });
-
-    const result = {
-      name,
-      lowest_price: parsePrice(d.lowest_price),
-      median_price: parsePrice(d.median_price),
-      volume: d.volume,
-    };
-    cache.set(key, { data: result, ts: Date.now() });
-    res.json(result);
+    const data = await fetchItemData(name);
+    res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const status = err.message === 'rate_limited' ? 429 : 500;
+    res.status(status).json({ error: err.message });
   }
 });
 
-// ─── Batch price fetch ────────────────────────────────────────────────────────
+// ─── Batch prices ─────────────────────────────────────────────────────────────
 app.post('/prices', async (req, res) => {
   const names = req.body.names;
   if (!Array.isArray(names) || !names.length) return res.status(400).json({ error: 'Need names array' });
 
   const results = {};
   for (const name of names) {
-    const key = 'price:' + name.toLowerCase();
-    const hit = cache.get(key);
-    if (hit && Date.now() - hit.ts < CACHE_TTL) {
-      results[name] = { ...hit.data, cached: true };
-      continue;
-    }
     try {
-      const r = await fetch(STEAM_PRICE_URL + encodeURIComponent(name), {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-      });
-      if (r.status === 429) { results[name] = { error: 'rate_limited' }; break; }
-      const d = await r.json();
-      if (!d.success) {
-        results[name] = { error: 'not_found' };
-      } else {
-        const result = {
-          name,
-          lowest_price: parsePrice(d.lowest_price),
-          median_price: parsePrice(d.median_price),
-          volume: d.volume,
-        };
-        cache.set(key, { data: result, ts: Date.now() });
-        results[name] = result;
-      }
+      results[name] = await fetchItemData(name);
     } catch (err) {
+      if (err.message === 'rate_limited') { results[name] = { error: 'rate_limited' }; break; }
       results[name] = { error: err.message };
     }
-    await delay(1200); // respect Steam rate limit
+    await delay(1500); // safe gap between items
   }
   res.json(results);
 });
 
-// ─── Search (for autocomplete) ────────────────────────────────────────────────
+// ─── Search autocomplete ──────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
   const q = req.query.q;
   if (!q || q.length < 2) return res.json([]);
 
   const key = 'search:' + q.toLowerCase();
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.ts < SEARCH_CACHE_TTL) return res.json(hit.data);
+  if (hit && Date.now() - hit.ts < SEARCH_TTL) return res.json(hit.data);
 
   try {
-    const r = await fetch(STEAM_SEARCH_URL + encodeURIComponent(q), {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
+    const url = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=10&query=${encodeURIComponent(q)}`;
+    const r = await fetch(url, { headers: HEADERS });
     const d = await r.json();
     if (!d.success || !d.results) return res.json([]);
 
@@ -110,17 +133,17 @@ app.get('/search', async (req, res) => {
       icon: item.asset_description?.icon_url
         ? `https://community.akamai.steamstatic.com/economy/image/${item.asset_description.icon_url}/75fx75f`
         : null,
-      price: item.sale_price_text || null,
+      price: item.sell_price_text || null,
     }));
 
     cache.set(key, { data: results, ts: Date.now() });
     res.json(results);
-  } catch (err) {
+  } catch {
     res.json([]);
   }
 });
 
-// ─── Icon batch fetch — get icons for a list of item names via search ─────────
+// ─── Icons batch ──────────────────────────────────────────────────────────────
 app.post('/icons', async (req, res) => {
   const names = req.body.names;
   if (!Array.isArray(names)) return res.status(400).json({ error: 'Need names array' });
@@ -129,29 +152,21 @@ app.post('/icons', async (req, res) => {
   for (const name of names) {
     const key = 'icon:' + name.toLowerCase();
     const hit = cache.get(key);
-    if (hit && Date.now() - hit.ts < 60 * 60 * 1000) { // icons cached 1hr
-      results[name] = hit.data;
-      continue;
-    }
+    if (hit && Date.now() - hit.ts < ICON_TTL) { results[name] = hit.data; continue; }
     try {
-      const r = await fetch(STEAM_SEARCH_URL + encodeURIComponent(name) + '&count=1', {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-      });
+      const url = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=1&query=${encodeURIComponent(name)}`;
+      const r = await fetch(url, { headers: HEADERS });
       const d = await r.json();
       const iconHash = d?.results?.[0]?.asset_description?.icon_url;
-      const icon = iconHash
-        ? `https://community.akamai.steamstatic.com/economy/image/${iconHash}/75fx75f`
-        : null;
+      const icon = iconHash ? `https://community.akamai.steamstatic.com/economy/image/${iconHash}/75fx75f` : null;
       cache.set(key, { data: icon, ts: Date.now() });
       results[name] = icon;
-    } catch {
-      results[name] = null;
-    }
-    await delay(400); // search endpoint is less strict
+    } catch { results[name] = null; }
+    await delay(400);
   }
   res.json(results);
 });
 
 app.get('/health', (req, res) => res.json({ ok: true, cached: cache.size }));
 
-app.listen(PORT, () => console.log(`Proxy running on :${PORT}`));
+app.listen(PORT, () => console.log(`Proxy on :${PORT}`));
