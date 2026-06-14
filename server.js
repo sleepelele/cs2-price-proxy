@@ -113,6 +113,44 @@ app.post('/prices', async (req, res) => {
   res.json(results);
 });
 
+
+// Search endpoint — proxies Steam market search for autocomplete
+// Returns item names + icons for CS2 (appid 730)
+app.get('/search', async (req, res) => {
+  const q = req.query.q;
+  if (!q || q.length < 2) return res.json([]);
+
+  const cacheKey = 'search:' + q.toLowerCase();
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 30000) { // 30s cache for search
+    return res.json(cached.data);
+  }
+
+  try {
+    const url = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=10&query=${encodeURIComponent(q)}`;
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    const data = await response.json();
+
+    if (!data.success || !data.results) return res.json([]);
+
+    const results = data.results.map(item => ({
+      name: item.hash_name,
+      icon: item.asset_description?.icon_url
+        ? `https://community.akamai.steamstatic.com/economy/image/${item.asset_description.icon_url}/75fx75f`
+        : null,
+      lowest_price: item.sale_price_text || null,
+    }));
+
+    cache.set(cacheKey, { data: results, ts: Date.now() });
+    res.json(results);
+  } catch (err) {
+    console.error('Search error:', err.message);
+    res.json([]);
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, cached: cache.size }));
 
 app.listen(PORT, () => console.log(`CS2 price proxy running on :${PORT}`));
