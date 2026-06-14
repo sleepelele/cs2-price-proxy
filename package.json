@@ -1,0 +1,16 @@
+{
+  "name": "cs2-price-proxy",
+  "version": "1.0.0",
+  "description": "Steam market price proxy for CS2 portfolio tracker",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
