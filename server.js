@@ -6,176 +6,152 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Cache prices for 5 minutes to avoid Steam rate limits
 const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000;
+const CACHE_TTL = 5 * 60 * 1000; // 5 min for prices
+const SEARCH_CACHE_TTL = 30 * 1000; // 30s for search
 
-// Steam market priceoverview endpoint
-// currency=3 = EUR
-const STEAM_URL = 'https://steamcommunity.com/market/priceoverview/?appid=730&currency=3&market_hash_name=';
+const STEAM_PRICE_URL = 'https://steamcommunity.com/market/priceoverview/?appid=730&currency=3&market_hash_name=';
+const STEAM_SEARCH_URL = 'https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=10&query=';
 
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
+function parsePrice(raw) {
+  if (!raw) return null;
+  return parseFloat(raw.replace(/[^0-9.,]/g, '').replace(',', '.')) || null;
+}
+
+// ─── Single price fetch ───────────────────────────────────────────────────────
 app.get('/price', async (req, res) => {
   const name = req.query.name;
-  if (!name) return res.status(400).json({ error: 'Missing name param' });
+  if (!name) return res.status(400).json({ error: 'Missing name' });
 
-  const cacheKey = name.toLowerCase();
-  const cached = cache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    return res.json({ ...cached.data, cached: true });
-  }
+  const key = 'price:' + name.toLowerCase();
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.ts < CACHE_TTL) return res.json({ ...hit.data, cached: true });
 
   try {
-    const url = STEAM_URL + encodeURIComponent(name);
-    const response = await fetch(url);
-
-    if (response.status === 429) {
-      return res.status(429).json({ error: 'Steam rate limited, try again in a minute' });
-    }
-
-    const data = await response.json();
-
-    if (!data.success) {
-      return res.status(404).json({ error: 'Item not found on Steam market', name });
-    }
-
-    // Parse EUR price string like "0,49€" or "€0.49"
-    const rawLowest = data.lowest_price || data.median_price || '0';
-    const price = parseFloat(rawLowest.replace(/[^0-9.,]/g, '').replace(',', '.'));
-
-    // Also grab icon via market search
-    let icon = null;
-    try {
-      const searchUrl = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=1&query=${encodeURIComponent(name)}`;
-      const sr = await fetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-      const sd = await sr.json();
-      if (sd.success && sd.results && sd.results[0]) {
-        const iconHash = sd.results[0]?.asset_description?.icon_url;
-        if (iconHash) icon = `https://community.akamai.steamstatic.com/economy/image/${iconHash}/75fx75f`;
-      }
-    } catch {}
+    const r = await fetch(STEAM_PRICE_URL + encodeURIComponent(name), {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    if (r.status === 429) return res.status(429).json({ error: 'Steam rate limited' });
+    const d = await r.json();
+    if (!d.success) return res.status(404).json({ error: 'Not found', name });
 
     const result = {
       name,
-      lowest_price: price,
-      raw_lowest: data.lowest_price,
-      median_price: data.median_price,
-      volume: data.volume,
-      icon,
+      lowest_price: parsePrice(d.lowest_price),
+      median_price: parsePrice(d.median_price),
+      volume: d.volume,
     };
-
-    cache.set(cacheKey, { data: result, ts: Date.now() });
+    cache.set(key, { data: result, ts: Date.now() });
     res.json(result);
-
   } catch (err) {
-    console.error('Steam fetch error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch from Steam', detail: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Batch endpoint — fetches multiple items with 1.2s delay between calls
+// ─── Batch price fetch ────────────────────────────────────────────────────────
 app.post('/prices', async (req, res) => {
   const names = req.body.names;
-  if (!Array.isArray(names) || names.length === 0) {
-    return res.status(400).json({ error: 'Body must be { names: [...] }' });
-  }
+  if (!Array.isArray(names) || !names.length) return res.status(400).json({ error: 'Need names array' });
 
   const results = {};
-  const delay = ms => new Promise(r => setTimeout(r, ms));
-
   for (const name of names) {
-    const cacheKey = name.toLowerCase();
-    const cached = cache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < CACHE_TTL) {
-      results[name] = { ...cached.data, cached: true };
+    const key = 'price:' + name.toLowerCase();
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.ts < CACHE_TTL) {
+      results[name] = { ...hit.data, cached: true };
       continue;
     }
-
     try {
-      const url = STEAM_URL + encodeURIComponent(name);
-      const response = await fetch(url);
-
-      if (response.status === 429) {
-        results[name] = { error: 'rate_limited' };
-        break;
-      }
-
-      const data = await response.json();
-      if (!data.success) {
+      const r = await fetch(STEAM_PRICE_URL + encodeURIComponent(name), {
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
+      if (r.status === 429) { results[name] = { error: 'rate_limited' }; break; }
+      const d = await r.json();
+      if (!d.success) {
         results[name] = { error: 'not_found' };
       } else {
-        const rawLowest = data.lowest_price || data.median_price || '0';
-        const price = parseFloat(rawLowest.replace(/[^0-9.,]/g, '').replace(',', '.'));
-        // Grab icon via search
-        let icon = null;
-        try {
-          const searchUrl = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=1&query=${encodeURIComponent(name)}`;
-          const sr = await fetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-          const sd = await sr.json();
-          if (sd.success && sd.results && sd.results[0]) {
-            const iconHash = sd.results[0]?.asset_description?.icon_url;
-            if (iconHash) icon = `https://community.akamai.steamstatic.com/economy/image/${iconHash}/75fx75f`;
-          }
-        } catch {}
         const result = {
           name,
-          lowest_price: price,
-          raw_lowest: data.lowest_price,
-          median_price: data.median_price,
-          volume: data.volume,
-          icon,
+          lowest_price: parsePrice(d.lowest_price),
+          median_price: parsePrice(d.median_price),
+          volume: d.volume,
         };
-        cache.set(cacheKey, { data: result, ts: Date.now() });
+        cache.set(key, { data: result, ts: Date.now() });
         results[name] = result;
       }
     } catch (err) {
       results[name] = { error: err.message };
     }
-
-    // Respect Steam rate limit: 1 req/sec
-    await delay(1200);
+    await delay(1200); // respect Steam rate limit
   }
-
   res.json(results);
 });
 
-
-// Search endpoint — proxies Steam market search for autocomplete
-// Returns item names + icons for CS2 (appid 730)
+// ─── Search (for autocomplete) ────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
   const q = req.query.q;
   if (!q || q.length < 2) return res.json([]);
 
-  const cacheKey = 'search:' + q.toLowerCase();
-  const cached = cache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < 30000) { // 30s cache for search
-    return res.json(cached.data);
-  }
+  const key = 'search:' + q.toLowerCase();
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.ts < SEARCH_CACHE_TTL) return res.json(hit.data);
 
   try {
-    const url = `https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=10&query=${encodeURIComponent(q)}`;
-    const response = await fetch(url, {
+    const r = await fetch(STEAM_SEARCH_URL + encodeURIComponent(q), {
       headers: { 'User-Agent': 'Mozilla/5.0' }
     });
-    const data = await response.json();
+    const d = await r.json();
+    if (!d.success || !d.results) return res.json([]);
 
-    if (!data.success || !data.results) return res.json([]);
-
-    const results = data.results.map(item => ({
+    const results = d.results.map(item => ({
       name: item.hash_name,
       icon: item.asset_description?.icon_url
         ? `https://community.akamai.steamstatic.com/economy/image/${item.asset_description.icon_url}/75fx75f`
         : null,
-      lowest_price: item.sale_price_text || null,
+      price: item.sale_price_text || null,
     }));
 
-    cache.set(cacheKey, { data: results, ts: Date.now() });
+    cache.set(key, { data: results, ts: Date.now() });
     res.json(results);
   } catch (err) {
-    console.error('Search error:', err.message);
     res.json([]);
   }
 });
 
+// ─── Icon batch fetch — get icons for a list of item names via search ─────────
+app.post('/icons', async (req, res) => {
+  const names = req.body.names;
+  if (!Array.isArray(names)) return res.status(400).json({ error: 'Need names array' });
+
+  const results = {};
+  for (const name of names) {
+    const key = 'icon:' + name.toLowerCase();
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.ts < 60 * 60 * 1000) { // icons cached 1hr
+      results[name] = hit.data;
+      continue;
+    }
+    try {
+      const r = await fetch(STEAM_SEARCH_URL + encodeURIComponent(name) + '&count=1', {
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
+      const d = await r.json();
+      const iconHash = d?.results?.[0]?.asset_description?.icon_url;
+      const icon = iconHash
+        ? `https://community.akamai.steamstatic.com/economy/image/${iconHash}/75fx75f`
+        : null;
+      cache.set(key, { data: icon, ts: Date.now() });
+      results[name] = icon;
+    } catch {
+      results[name] = null;
+    }
+    await delay(400); // search endpoint is less strict
+  }
+  res.json(results);
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, cached: cache.size }));
 
-app.listen(PORT, () => console.log(`CS2 price proxy running on :${PORT}`));
+app.listen(PORT, () => console.log(`Proxy running on :${PORT}`));
