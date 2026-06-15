@@ -176,5 +176,35 @@ app.post('/icons', async (req, res) => {
   res.json(results);
 });
 
+
+// ─── Debug — see raw steamapis bulk response for a few items ─────────────────
+app.get('/debug-bulk', async (req, res) => {
+  if (!STEAMAPIS_KEY) return res.json({ error: 'No STEAMAPIS_KEY set' });
+  try {
+    const url = `https://api.steamapis.com/market/items/730?api_key=${STEAMAPIS_KEY}&format=compact`;
+    const r = await fetch(url);
+    const raw = await r.json();
+    // Return status, structure info, and a few sample items so we can see the format
+    const data = raw.data || raw;
+    const sampleKeys = Object.keys(data).slice(0, 3);
+    const samples = {};
+    sampleKeys.forEach(k => samples[k] = data[k]);
+    // Also look up specific items we care about
+    const lookup = ['Operation Breakout Weapon Case', 'Fracture Case', 'Revolution Case'];
+    const found = {};
+    lookup.forEach(name => found[name] = data[name]);
+    res.json({
+      http_status: r.status,
+      top_level_keys: Object.keys(raw),
+      data_type: typeof data,
+      total_items: Object.keys(data).length,
+      sample_items: samples,
+      our_items: found,
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, cached: cache.size, has_key: !!STEAMAPIS_KEY }));
 app.listen(PORT, () => console.log(`Proxy on :${PORT} | steamapis: ${STEAMAPIS_KEY ? 'SET' : 'NOT SET'}`));
