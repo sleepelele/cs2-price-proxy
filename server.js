@@ -63,7 +63,7 @@ app.get('/price', async (req, res) => {
     if (bulk) {
       const priceUSD = bulk[name];
       if (priceUSD != null) {
-        const result = { name, lowest_price_usd: priceUSD / 100, source: 'steamapis_bulk' };
+        const result = { name, lowest_price_usd: priceUSD, source: 'steamapis_bulk' };
         cache.set(key, { data: result, ts: Date.now() });
         return res.json(result);
       }
@@ -100,7 +100,7 @@ app.post('/prices', async (req, res) => {
       for (const name of names) {
         const priceUSD = bulk[name];
         if (priceUSD != null) {
-          results[name] = { name, lowest_price_usd: priceUSD / 100, source: 'steamapis_bulk' };
+          results[name] = { name, lowest_price_usd: priceUSD, source: 'steamapis_bulk' };
         } else {
           allFound = false;
           results[name] = { error: 'not_in_bulk' };
