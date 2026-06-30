@@ -7,6 +7,8 @@ app.use(cors());
 app.use(express.json());
 
 const STEAMAPIS_KEY = process.env.STEAMAPIS_KEY || '';
+// Office Spotify Skip app — different Render IP, gets real EUR from Steam
+const OFFICE_PROXY = 'https://office-spotify-skip.onrender.com';
 const cache = new Map();
 const PRICE_TTL = 10 * 60 * 1000;  // 10 min
 const BULK_TTL  = 10 * 60 * 1000;  // 10 min for bulk fetch
@@ -57,78 +59,65 @@ app.get('/price', async (req, res) => {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.ts < PRICE_TTL) return res.json({ ...hit.data, cached: true });
 
-  // Try bulk map first
+  // Try office proxy first for exact EUR
+  try {
+    const price = await fetchEurFromOfficeProxy(name);
+    if (price != null) {
+      const result = { name, lowest_price: price, source: 'steam_eur' };
+      cache.set(key, { data: result, ts: Date.now() });
+      return res.json(result);
+    }
+  } catch (e) { console.warn('office proxy error:', e.message); }
+
+  // Fallback: steamapis bulk USD
   try {
     const bulk = await fetchBulkPrices();
-    if (bulk) {
-      const priceUSD = bulk[name];
-      if (priceUSD != null) {
-        const result = { name, lowest_price_usd: priceUSD, source: 'steamapis_bulk' };
-        cache.set(key, { data: result, ts: Date.now() });
-        return res.json(result);
-      }
+    if (bulk && bulk[name] != null) {
+      const result = { name, lowest_price_usd: bulk[name], source: 'steamapis_bulk' };
+      cache.set(key, { data: result, ts: Date.now() });
+      return res.json(result);
     }
   } catch (e) { console.warn('bulk lookup error:', e.message); }
 
-  // Fallback: Steam priceoverview EUR
-  try {
-    const url = `https://steamcommunity.com/market/priceoverview/?appid=730&currency=3&market_hash_name=${encodeURIComponent(name)}`;
-    const r = await fetch(url, { headers: STEAM_HEADERS });
-    if (r.status === 429) return res.status(429).json({ error: 'Steam rate limited' });
-    const d = await r.json();
-    if (!d.success) return res.status(404).json({ error: 'not_found', name });
-    const result = { name, lowest_price: parseEur(d.lowest_price), median_price: parseEur(d.median_price), source: 'steam' };
-    cache.set(key, { data: result, ts: Date.now() });
-    return res.json(result);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
+  return res.status(404).json({ error: 'not_found', name });
 });
 
-// ─── Batch prices — uses ONE bulk steamapis call then maps results ─────────────
+// ─── Batch prices — EUR via office proxy, fallback to steamapis bulk ──────────
 app.post('/prices', async (req, res) => {
   const names = req.body.names;
   if (!Array.isArray(names) || !names.length) return res.status(400).json({ error: 'Need names[]' });
 
   const results = {};
 
-  // Try bulk first — all items in one shot
-  try {
-    const bulk = await fetchBulkPrices();
-    if (bulk) {
-      let allFound = true;
-      for (const name of names) {
-        const priceUSD = bulk[name];
-        if (priceUSD != null) {
-          results[name] = { name, lowest_price_usd: priceUSD, source: 'steamapis_bulk' };
-        } else {
-          allFound = false;
-          results[name] = { error: 'not_in_bulk' };
-        }
-      }
-      if (allFound) return res.json(results);
-    }
-  } catch (e) { console.warn('bulk prices error:', e.message); }
-
-  // Fallback: Steam per-item for any that failed
+  // Fetch EUR per item via office proxy (exact Steam EUR prices)
   for (const name of names) {
-    if (results[name] && !results[name].error) continue; // already got it from bulk
-
     const key = 'price:' + name.toLowerCase();
     const hit = cache.get(key);
     if (hit && Date.now() - hit.ts < PRICE_TTL) { results[name] = { ...hit.data, cached: true }; continue; }
 
     try {
-      const url = `https://steamcommunity.com/market/priceoverview/?appid=730&currency=3&market_hash_name=${encodeURIComponent(name)}`;
-      const r = await fetch(url, { headers: STEAM_HEADERS });
-      if (r.status === 429) { results[name] = { error: 'rate_limited' }; break; }
-      const d = await r.json();
-      if (!d.success) { results[name] = { error: 'not_found' }; continue; }
-      const result = { name, lowest_price: parseEur(d.lowest_price), median_price: parseEur(d.median_price), source: 'steam' };
-      cache.set(key, { data: result, ts: Date.now() });
-      results[name] = result;
-    } catch (err) { results[name] = { error: err.message }; }
-    await delay(1500);
+      const price = await fetchEurFromOfficeProxy(name);
+      if (price != null) {
+        const result = { name, lowest_price: price, source: 'steam_eur' };
+        cache.set(key, { data: result, ts: Date.now() });
+        results[name] = result;
+        await delay(1200); // respect Steam rate limit via office proxy
+        continue;
+      }
+    } catch (e) { console.warn(`office proxy failed for ${name}:`, e.message); }
+
+    // Fallback: steamapis bulk USD
+    try {
+      const bulk = await fetchBulkPrices();
+      if (bulk && bulk[name] != null) {
+        const result = { name, lowest_price_usd: bulk[name], source: 'steamapis_bulk' };
+        cache.set(key, { data: result, ts: Date.now() });
+        results[name] = result;
+        continue;
+      }
+    } catch (e) { console.warn('bulk fallback error:', e.message); }
+
+    results[name] = { error: 'not_found' };
   }
   res.json(results);
 });
@@ -157,12 +146,13 @@ app.get('/search', async (req, res) => {
 // ─── Icons ────────────────────────────────────────────────────────────────────
 app.post('/icons', async (req, res) => {
   const names = req.body.names;
+  const force = req.body.force === true;
   if (!Array.isArray(names)) return res.status(400).json({ error: 'Need names[]' });
   const results = {};
   for (const name of names) {
     const key = 'icon:' + name.toLowerCase();
     const hit = cache.get(key);
-    if (hit && Date.now() - hit.ts < ICON_TTL) { results[name] = hit.data; continue; }
+    if (!force && hit && Date.now() - hit.ts < ICON_TTL) { results[name] = hit.data; continue; }
     try {
       const r = await fetch(`https://steamcommunity.com/market/search/render/?appid=730&norender=1&count=1&query=${encodeURIComponent(name)}`, { headers: STEAM_HEADERS });
       const d = await r.json();
@@ -175,6 +165,7 @@ app.post('/icons', async (req, res) => {
   }
   res.json(results);
 });
+
 
 
 // ─── Debug — see raw steamapis bulk response for a few items ─────────────────
@@ -205,6 +196,16 @@ app.get('/debug-bulk', async (req, res) => {
     res.json({ error: err.message });
   }
 });
+
+// ─── Get exact EUR price via office-spotify-skip proxy ───────────────────────
+async function fetchEurFromOfficeProxy(name) {
+  const r = await fetch(`${OFFICE_PROXY}/steam-price?name=${encodeURIComponent(name)}`);
+  if (!r.ok) throw new Error(`office proxy ${r.status}`);
+  const d = await r.json();
+  if (!d.success) throw new Error('not_found');
+  const parseEurStr = raw => raw ? parseFloat(raw.replace(/[^0-9.,]/g, '').replace(',', '.')) : null;
+  return parseEurStr(d.lowest_price) || parseEurStr(d.median_price);
+}
 
 app.get('/health', (req, res) => res.json({ ok: true, cached: cache.size, has_key: !!STEAMAPIS_KEY }));
 app.listen(PORT, () => console.log(`Proxy on :${PORT} | steamapis: ${STEAMAPIS_KEY ? 'SET' : 'NOT SET'}`));
